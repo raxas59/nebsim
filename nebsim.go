@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unsafe"
 )
 
 /*
@@ -23,35 +24,33 @@ import (
  */
 const INV_EXCEP = 0
 
-type RefCnt struct {
-	
-}
-
 type L3Ptbl struct {
 	lvl  int
+	refcnt	int
 	ttes [] int64
 }
 
-type L2Ptbl struct {
+type Ptbl struct {
 	lvl  int
-	ttes []*L3Ptbl
-}
-
-type L1Ptbl struct {
-	lvl  int
-	ttes []*L2Ptbl
+	refcnt	int
+	ttes []*Ptbl
 }
 
 type VvHdr struct {
 	id    int
 	name  string
-	l1ptr [8]*L1Ptbl
+	l1ptr [8]*Ptbl
 	child int
+	parent int
 }
 
 var vvTbl []VvHdr
 
 var headerDone int
+
+var refMap map[uint64]int
+
+var curVvId int
 
 func checkError(err error, msg string) {
 	if err != nil {
@@ -60,8 +59,13 @@ func checkError(err error, msg string) {
 	}
 }
 
+func ptblToPtblVal(curPtbl *Ptbl) uint64 {
+	retVal := uint64(uintptr(unsafe.Pointer(curPtbl)))
+
+	return (retVal)
+}
+
 func dumpL3Ptbl(vvid int, rootIdx int, l1idx int, l2idx int, l3ptbl *L3Ptbl) {
-	//fmt.Printf("dumpL3Ptbl\n")
 	for i := 0; i < 1024; i++ {
 		if l3ptbl.ttes[i] != 0 {
 			if (headerDone == 0) {
@@ -73,67 +77,54 @@ func dumpL3Ptbl(vvid int, rootIdx int, l1idx int, l2idx int, l3ptbl *L3Ptbl) {
 	}
 }
 
-func dumpL2Ptbl(vvId int, rootIdx int, l1idx int, l2ptbl *L2Ptbl) {
-	//fmt.Printf("dumpL2Ptbl\n")
+func walkL2Ptbl(vvId int, rootIdx int, l1idx int, ptbl *Ptbl) {
+    var l3ptbl *L3Ptbl
 	for i := 0; i < 1024; i++ {
-		if l2ptbl.ttes[i] != nil {
-			dumpL3Ptbl(vvId, rootIdx, l1idx, i, l2ptbl.ttes[i])
+		if ptbl.ttes[i] != nil {
+		    l3ptbl = (*L3Ptbl)(unsafe.Pointer(ptbl.ttes[i]))
+			dumpL3Ptbl(vvId, rootIdx, l1idx, i, l3ptbl)
 		}
 	}
 }
 
-func dumpPtbl(vvId int, rootIdx int, l1ptbl *L1Ptbl) {
-	//fmt.Printf("dumpPtbl\n")
+/*
+ * vvId - id of vv whose ptbls are being printed.
+ * rootIdx - index in root table that we are printing.
+ */
+func walkL1Ptbl(vvId int, rootIdx int, ptbl *Ptbl) {
 	for i := 0; i < 1024; i++ {
-		if l1ptbl.ttes[i] != nil {
-			dumpL2Ptbl(vvId, rootIdx, i, l1ptbl.ttes[i])
-		}
-	}
-}
-
-func dumpRootPtrs(vvInd int) {
-	//fmt.Printf("dumpRootPtrs\n")
-	for i := 0; i < 8; i++ {
-		if vvTbl[vvInd].l1ptr[i] != nil {
-			fmt.Printf("vvid %d i %d not nil\n", vvTbl[vvInd].id, i);
-		} else {
-			fmt.Printf("vvid %d rootIdx %d nil\n", vvTbl[vvInd].id, i)
+		if ptbl.ttes[i] != nil {
+			walkL2Ptbl(vvId, rootIdx, i, ptbl.ttes[i])
 		}
 	}
 }
 
 func dumpPtbls() {
-	for i := 0; i < len(vvTbl); i++ {
+	for i := 1; i < len(vvTbl); i++ {
 		for j := 0; j < 8; j++ {
 			if vvTbl[i].l1ptr[j] != nil {
-				dumpPtbl(i, j, vvTbl[i].l1ptr[j])
-			} else {
-				// fmt.Printf("vvid %d rootIdx %d nil\n", i, j)
+				walkL1Ptbl(i, j, vvTbl[i].l1ptr[j])
 			}
 		}
 	}
 }
 
-func newL1Ptbl(lvl int) *L1Ptbl {
-	retPtbl := new(L1Ptbl)
-	retPtbl.lvl = lvl
-	retPtbl.ttes = make([]*L2Ptbl, 1024, 1024)
+func copyPtbl(curPtbl *Ptbl) *Ptbl {
+	retPtbl := new(Ptbl)
+	retPtbl.lvl = curPtbl.lvl
+	retPtbl.ttes = make([]*Ptbl, 1024, 1024)
+
+	for i := 0; i < 1024; i++ {
+		retPtbl.ttes[i] = curPtbl.ttes[i]
+	}
 
 	return retPtbl
 }
 
-func newL2Ptbl(lvl int) *L2Ptbl {
-	retPtbl := new(L2Ptbl)
+func newPtbl(lvl int) *Ptbl {
+	retPtbl := new(Ptbl)
 	retPtbl.lvl = lvl
-	retPtbl.ttes = make([]*L3Ptbl, 1024, 1024)
-
-	return retPtbl
-}
-
-func newL3Ptbl(lvl int) *L3Ptbl {
-	retPtbl := new(L3Ptbl)
-	retPtbl.lvl = lvl
-	retPtbl.ttes = make([]int64, 1024, 1024)
+	retPtbl.ttes = make([]*Ptbl, 1024, 1024)
 
 	return retPtbl
 }
@@ -160,6 +151,55 @@ func l2idx(pgaddr int64) int {
 	return (int(ret))
 }
 
+func decrRef(ptblAddr uint64) {
+	val := refMap[ptblAddr]
+	if val <= 1 {
+		fmt.Printf("ptblAddr %v bad refcount %v\n", ptblAddr, val)
+		panic("incrRef")
+	}
+	refMap[ptblAddr] = val - 1
+}
+
+func incrRef(ptblAddr uint64) {
+	val := refMap[ptblAddr]
+	if val == 0 {
+		fmt.Printf("ptblAddr %v doesn't exist\n", ptblAddr)
+		panic("incrRef")
+	}
+	refMap[ptblAddr] = val + 1
+}
+
+/*
+ * We need to return a new ptbl which is a copy of this ptbl.
+ * new ptbl will have a refcount of 1.
+ * refcount of pagetable being passed in will get decremented by 1
+ * Also need to increment the refcounts of all the ptbls pointed
+ * to by this ptbl unless this is a level 3 ptbl.
+ */
+func doCow(curPtbl *Ptbl) *Ptbl {
+
+	fmt.Printf("doCow for lvl %d\n", curPtbl.lvl)
+
+	retPtbl := copyPtbl(curPtbl)
+
+	if curPtbl.lvl == 3 {
+		return (retPtbl)
+	}
+
+	for i := 0; i < 1024; i++ {
+		ptbl := curPtbl.ttes[i]
+		ptblVal := ptblToPtblVal(ptbl)
+		if ptblVal != 0 {
+			incrRef(ptblVal)
+		}
+	}
+
+	curPtblVal := ptblToPtblVal(curPtbl)
+	decrRef(curPtblVal)
+
+	return (retPtbl)
+}
+
 /*
  * l1idx returns a 3 bit index to pick one of
  * eight l1 ptbls, and a 10 bit index into that
@@ -179,19 +219,24 @@ func l1idx(pgaddr int64) (int, int) {
 }
 
 /*
- * 1 <addr> <len>
+ * 2 <vvid> <addr> <len>
  */
-func doIo(tokens []string) {
+func doRead(tokens []string) {
 
 	var vhdr *VvHdr
+	var l3Ptbl *L3Ptbl
+	var vvId int64
 
-	addr, err := strconv.ParseInt(tokens[1], 0, 64)
+	vvId, err := strconv.ParseInt(tokens[1], 0, 64)
 	checkError(err, "ParseInt addr")
 
-	len, err := strconv.ParseInt(tokens[2], 0, 64)
+	addr, err := strconv.ParseInt(tokens[2], 0, 64)
+	checkError(err, "ParseInt addr")
+
+	len, err := strconv.ParseInt(tokens[3], 0, 64)
 	checkError(err, "ParseInt len")
 
-	fmt.Printf("IO Addr: 0x%x Len: 0x%x\n", addr, len)
+	fmt.Printf("Read vvId: %d Addr: 0x%x Len: 0x%x\n", vvId, addr, len)
 
 	pgAddr := dblk2pg(addr)
 
@@ -201,47 +246,151 @@ func doIo(tokens []string) {
 
 	fmt.Printf("Addr: 0x%x L1: 0x%x IndexInL1: 0x%x L2: 0x%x L3: 0x%x\n", addr, l1, indexInL1, l2, l3)
 
-	vhdr = &vvTbl[0]
+	vhdr = &vvTbl[vvId]
 
 	if vhdr.l1ptr[l1] == nil {
-		//fmt.Printf("Need l1 tbl allocation idx %d\n", l1)
-		vhdr.l1ptr[l1] = newL1Ptbl(1)
-		//dumpRootPtrs(0)
-		//fmt.Printf("Index %d in root set to %v\n", l1, vhdr.l1ptr[l1]);
+		fmt.Printf("Read vvId: %d Addr: 0x%x Len: 0x%x Index l1: %d nil\n", vvId, addr, len, l1)
+		return
 	}
 
 	l1Ptbl := vhdr.l1ptr[l1]
 
 	if l1Ptbl.ttes[indexInL1] == nil {
-		//fmt.Printf("Need l2 tbl allocation\n")
-		l1Ptbl.ttes[indexInL1] = newL2Ptbl(2)
-		//fmt.Printf("Index %d in l1Ptbl set to %v\n", indexInL1, l1Ptbl.ttes[indexInL1])
+		fmt.Printf("Read vvId: %d Addr: 0x%x Len: 0x%x Index in l1: %d nil\n", vvId, addr, len, indexInL1)
+		return
 	}
 
 	l2Ptbl := l1Ptbl.ttes[indexInL1]
 
 	if l2Ptbl.ttes[l2] == nil {
-		//fmt.Printf("Need l3 tbl allocation\n")
-		l2Ptbl.ttes[l2] = newL3Ptbl(3)
-		//fmt.Printf("Index %d in l2Ptbl set to %v\n", l2, l2Ptbl.ttes[l2])
+		fmt.Printf("Read vvId: %d Addr: 0x%x Len: 0x%x Index in l2: %d nil\n", vvId, addr, len, l2)
+		return
 	}
 
-	l3Ptbl := l2Ptbl.ttes[l2]
+	l3Ptbl = (*L3Ptbl)(unsafe.Pointer(l2Ptbl.ttes[l2]))
 
-	if l3Ptbl.ttes[l3] == 0 {
-		l3Ptbl.ttes[l3] = addr
-		//fmt.Printf("L3 idx %d set to addr %d\n", l3, addr)
-	}
+	val := l3Ptbl.ttes[l3]
+
+	fmt.Printf("Addr: 0x%x L1: 0x%x IndexInL1: 0x%x L2: 0x%x L3: 0x%x val: 0x%x\n", addr, l1, indexInL1, l2, l3, val)
 }
 
 /*
- * 2 <svname>
+ * 1 <vvid> <addr> <len> <val>
  */
-func createSv(tokens []string) {
+func doWrite(tokens []string) {
+
+	var vhdr *VvHdr
+	var l3Ptbl *L3Ptbl
+	var ptblVal uint64
+	var nPtbl *Ptbl
+	var vvId int64
+
+	vvId, err := strconv.ParseInt(tokens[1], 0, 64)
+	checkError(err, "ParseInt addr")
+
+	addr, err := strconv.ParseInt(tokens[2], 0, 64)
+	checkError(err, "ParseInt addr")
+
+	len, err := strconv.ParseInt(tokens[3], 0, 64)
+	checkError(err, "ParseInt len")
+
+	val, err := strconv.ParseInt(tokens[4], 0, 64)
+	checkError(err, "ParseInt val")
+
+	fmt.Printf("Write Addr: vvId: %d 0x%x Len: 0x%x Val: 0x%x\n", vvId, addr, len, val)
+
+	pgAddr := dblk2pg(addr)
+
+	l1, indexInL1 := l1idx(pgAddr)
+	l2 := l2idx(pgAddr)
+	l3 := l3idx(pgAddr)
+
+	fmt.Printf("Addr: 0x%x L1: 0x%x IndexInL1: 0x%x L2: 0x%x L3: 0x%x\n", addr, l1, indexInL1, l2, l3)
+
+	vhdr = &vvTbl[vvId]
+
+	if vhdr.l1ptr[l1] == nil {
+		vhdr.l1ptr[l1] = newPtbl(1)
+		ptblVal = ptblToPtblVal(vhdr.l1ptr[l1])
+		refMap[ptblVal] = 1
+	}
+
+	l1Ptbl := vhdr.l1ptr[l1]
+	l1PtblVal := ptblToPtblVal(l1Ptbl)
+	if refMap[l1PtblVal] > 1 {
+		/*
+		 * Need to split this ptbl
+		 */
+		 nPtbl = doCow(l1Ptbl)
+		 l1Ptbl = nPtbl
+		 vhdr.l1ptr[l1] = l1Ptbl
+	}
+
+	if l1Ptbl.ttes[indexInL1] == nil {
+		l1Ptbl.ttes[indexInL1] = newPtbl(2)
+		ptblVal = ptblToPtblVal(l1Ptbl.ttes[indexInL1])
+		refMap[ptblVal] = 1
+	}
+
+	l2Ptbl := l1Ptbl.ttes[indexInL1]
+	l2PtblVal := ptblToPtblVal(l2Ptbl)
+	if refMap[l2PtblVal] > 1 {
+		nPtbl = doCow(l2Ptbl)
+		l2Ptbl = nPtbl
+		l1Ptbl.ttes[indexInL1] = l2Ptbl
+	}
+
+	if l2Ptbl.ttes[l2] == nil {
+		l2Ptbl.ttes[l2] = newPtbl(3)
+		ptblVal = ptblToPtblVal(l2Ptbl.ttes[l2])
+		refMap[ptblVal] = 1
+	}
+
+	l3Ptbl = (*L3Ptbl)(unsafe.Pointer(l2Ptbl.ttes[l2]))
+	l3PtblVal := ptblToPtblVal(l2Ptbl.ttes[l2])
+	if refMap[l3PtblVal] > 1 {
+		nPtbl = doCow(l2Ptbl.ttes[l2])
+		l3Ptbl = (*L3Ptbl)(unsafe.Pointer(nPtbl))
+		l2Ptbl.ttes[l2] = nPtbl
+	}
+
+	l3Ptbl.ttes[l3] = val
+
+	fmt.Printf("Setting l3 index %d to val %d\n", l3, val)
 }
 
 /*
  * 3 <svname>
+ */
+func createSv(tokens []string) {
+	var newVhdr VvHdr
+	var parVhdr *VvHdr
+
+	newVhdr.id = curVvId
+	newVhdr.name = tokens[1]
+	newVhdr.parent = 1
+
+	parVhdr = &vvTbl[1]
+
+	parVhdr.child = curVvId
+
+	for i := 0; i < 8; i++ {
+		newVhdr.l1ptr[i] = parVhdr.l1ptr[i]
+
+		if newVhdr.l1ptr[i] != nil {
+			l1ptbl := newVhdr.l1ptr[i]
+			l1ptblAddr := ptblToPtblVal(l1ptbl)
+			incrRef(l1ptblAddr)
+		}
+	}
+
+	vvTbl = append(vvTbl, newVhdr)
+
+	curVvId++
+}
+
+/*
+ * 4 <svname>
  */
 func deleteSv(tokens []string) {
 }
@@ -250,21 +399,42 @@ func doInit() {
 	var newVhdr VvHdr
 
 	newVhdr.id = 0
-	newVhdr.name = "firstVv"
+	newVhdr.name = "badVv"
 
 	vvTbl = append(vvTbl, newVhdr)
+
+	newVhdr.id = 1
+	newVhdr.name = "myVv"
+
+	vvTbl = append(vvTbl, newVhdr)
+
+	refMap = make(map[uint64]int)
+
+	curVvId = 2
 }
 
 func printVv(vhdr VvHdr) {
 	fmt.Printf("%16s : %d\n", "Id", vhdr.id)
 	fmt.Printf("%16s : %s\n", "Name", vhdr.name)
 	fmt.Printf("%16s : %d\n", "Child", vhdr.child)
+	fmt.Printf("%16s : %d\n\n", "Parent", vhdr.parent)
 }
 
 func showVvs() {
-	for i := 0; i < len(vvTbl); i++ {
+	for i := 1; i < len(vvTbl); i++ {
 		printVv(vvTbl[i])
 	}
+}
+
+func printPrompt() {
+	fmt.Printf("\n")
+	fmt.Printf("doWrite		: 1 <vvid> <addr> <len> <val>\n")
+	fmt.Printf("doRead		: 2 <vvid> <addr> <len>\n")
+	fmt.Printf("createSv	: 3 <svname>\n")
+	fmt.Printf("deleteSv	: 4 <svname>\n")
+	fmt.Printf("showVvs		: 5\n")
+	fmt.Printf("dumpPtbls	: 6\n")
+	fmt.Printf(">>> ")
 }
 
 func main() {
@@ -275,6 +445,7 @@ func main() {
 	reader := bufio.NewReader(os.Stdin)
 
 	for err == nil {
+		printPrompt()
 		text, err := reader.ReadString('\n')
 		if err == io.EOF {
 			break
@@ -287,14 +458,16 @@ func main() {
 		checkError(err, "Atoi ")
 
 		if opCode == 1 {
-			doIo(tokens)
+			doWrite(tokens)
 		} else if opCode == 2 {
-			createSv(tokens)
+			doRead(tokens)
 		} else if opCode == 3 {
-			deleteSv(tokens)
+			createSv(tokens)
 		} else if opCode == 4 {
-			showVvs()
+			deleteSv(tokens)
 		} else if opCode == 5 {
+			showVvs()
+		} else if opCode == 6 {
 			dumpPtbls()
 		} else {
 			panic("bad Opcode")
